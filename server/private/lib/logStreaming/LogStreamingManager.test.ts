@@ -18,6 +18,7 @@ import { LogStreamingManager } from "./LogStreamingManager";
 import config from "@server/lib/config";
 import { encrypt } from "@server/lib/crypto";
 import { LogDeliveryError } from "./providers/LogDestinationProvider";
+import { parseRetryAfterMs } from "./providers/HttpLogDestination";
 
 // Endpoint that accepts every request except the `failOn`-th (0-based) and
 // records the event ids it accepted.
@@ -156,7 +157,96 @@ async function testPartialDeliveryMovesTheCursor() {
     assertEquals(state.cursor, 2, "cursor stops at the last row of the batch");
 }
 
+// Like a Discord webhook: `limit` requests per window, then 429 with the
+// Retry-After header from `retryAfter(secondsLeftInWindow)`.
+async function withRateLimit(
+    limit: number,
+    windowMs: number,
+    retryAfter: (secondsLeft: number) => string,
+    run: (
+        url: string,
+        received: number[],
+        requests: () => number
+    ) => Promise<void>
+): Promise<void> {
+    const received: number[] = [];
+    let requests = 0;
+    let start = 0;
+    let used = 0;
+    const server = createServer((req, res) => {
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+            requests++;
+            const now = Date.now();
+            if (now - start >= windowMs) {
+                start = now;
+                used = 0;
+            }
+            if (used >= limit) {
+                const left = (windowMs - (now - start)) / 1000;
+                res.writeHead(429, { "Retry-After": retryAfter(left) });
+            } else {
+                used++;
+                received.push(JSON.parse(raw).data.id);
+                res.writeHead(204);
+            }
+            res.end();
+        });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    try {
+        await run(`http://127.0.0.1:${port}/`, received, () => requests);
+    } finally {
+        server.close();
+    }
+}
+
+async function testRetryAfterIsWaitedOut() {
+    console.log("Running Retry-After tests...");
+    await withRateLimit(5, 300, String, async (url, received, requests) => {
+        const { m, state } = manager(12);
+        await m.processDestination(destination(url));
+        assertEquals(state.cursor, 12, "whole batch delivered in one poll");
+        assertEquals(m.failures.has(1), false, "no back-off");
+        assertEquals(
+            received.join(","),
+            "1,2,3,4,5,6,7,8,9,10,11,12",
+            "once each, in order"
+        );
+        assertEquals(requests() > 12, true, "the endpoint pushed back");
+    });
+    await withRateLimit(
+        1,
+        60_000,
+        () => "60",
+        async (url, _r, requests) => {
+            const { m, state } = manager(3);
+            const started = Date.now();
+            await m.processDestination(destination(url));
+            assertEquals(
+                Date.now() - started < 1000,
+                true,
+                "a wait past the budget is not taken"
+            );
+            assertEquals(state.cursor, 1, "cursor keeps the delivered event");
+            assertEquals(requests(), 2, "no retry");
+        }
+    );
+
+    assertEquals(parseRetryAfterMs("1.5"), 1500, "seconds");
+    assertEquals(parseRetryAfterMs(null), null, "missing");
+    assertEquals(parseRetryAfterMs("soon"), null, "unparseable");
+    assertEquals(
+        parseRetryAfterMs(new Date(Date.now() - 1000).toUTCString()),
+        0,
+        "HTTP date in the past"
+    );
+}
+
 testPartialDeliveryMovesTheCursor()
+    .then(testRetryAfterIsWaitedOut)
     .then(() => console.log("All LogStreamingManager tests passed"))
     .catch((err) => {
         console.error(err);

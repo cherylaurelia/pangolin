@@ -11,6 +11,7 @@
  * This file is not licensed under the AGPLv3.
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
 import logger from "@server/logger";
 import { LogEvent, HttpConfig, PayloadFormat } from "../types";
 import {
@@ -24,6 +25,13 @@ import {
 
 /** Maximum time (ms) to wait for a single HTTP response. */
 const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Longest total time one `send()` call waits out 429 responses that carry a
+ * Retry-After header.  Once a wait would go past it, the send fails and the
+ * manager's back-off takes over.
+ */
+const RATE_LIMIT_WAIT_BUDGET_MS = 30_000;
 
 /** Default payload format when none is specified in the config. */
 const DEFAULT_FORMAT: PayloadFormat = "json_array";
@@ -89,6 +97,7 @@ export class HttpLogDestination implements LogDestinationProvider {
         if (events.length === 0) return;
 
         const format = this.config.format ?? DEFAULT_FORMAT;
+        const waitUntil = Date.now() + RATE_LIMIT_WAIT_BUDGET_MS;
 
         if (format === "json_single") {
             // One HTTP POST per event, sent in order.  If one fails, report how
@@ -97,7 +106,8 @@ export class HttpLogDestination implements LogDestinationProvider {
                 try {
                     await this.postRequest(
                         this.buildSingleBody(events[i]),
-                        "application/json"
+                        "application/json",
+                        waitUntil
                     );
                 } catch (err) {
                     const msg =
@@ -110,13 +120,13 @@ export class HttpLogDestination implements LogDestinationProvider {
 
         if (format === "ndjson") {
             const body = this.buildNdjsonBody(events);
-            await this.postRequest(body, "application/x-ndjson");
+            await this.postRequest(body, "application/x-ndjson", waitUntil);
             return;
         }
 
         // json_array (default)
         const body = JSON.stringify(this.buildArrayPayload(events));
-        await this.postRequest(body, "application/json");
+        await this.postRequest(body, "application/json", waitUntil);
     }
 
     // -----------------------------------------------------------------------
@@ -125,38 +135,53 @@ export class HttpLogDestination implements LogDestinationProvider {
 
     private async postRequest(
         body: string,
-        contentType: string
+        contentType: string,
+        waitUntil: number
     ): Promise<void> {
         const headers = this.buildHeaders(contentType);
 
-        const controller = new AbortController();
-        const timeoutHandle = setTimeout(
-            () => controller.abort(),
-            REQUEST_TIMEOUT_MS
-        );
-
         let response: Response;
-        try {
-            response = await fetch(this.config.url, {
-                method: "POST",
-                headers,
-                body,
-                signal: controller.signal
-            });
-        } catch (err: unknown) {
-            const isAbort =
-                err instanceof Error && err.name === "AbortError";
-            if (isAbort) {
-                throw new Error(
-                    `HttpLogDestination: request to "${this.config.url}" timed out after ${REQUEST_TIMEOUT_MS} ms`
-                );
-            }
-            const msg = err instanceof Error ? err.message : String(err);
-            throw new Error(
-                `HttpLogDestination: request to "${this.config.url}" failed – ${msg}`
+        for (;;) {
+            const controller = new AbortController();
+            const timeoutHandle = setTimeout(
+                () => controller.abort(),
+                REQUEST_TIMEOUT_MS
             );
-        } finally {
-            clearTimeout(timeoutHandle);
+
+            try {
+                response = await fetch(this.config.url, {
+                    method: "POST",
+                    headers,
+                    body,
+                    signal: controller.signal
+                });
+            } catch (err: unknown) {
+                const isAbort =
+                    err instanceof Error && err.name === "AbortError";
+                if (isAbort) {
+                    throw new Error(
+                        `HttpLogDestination: request to "${this.config.url}" timed out after ${REQUEST_TIMEOUT_MS} ms`
+                    );
+                }
+                const msg = err instanceof Error ? err.message : String(err);
+                throw new Error(
+                    `HttpLogDestination: request to "${this.config.url}" failed – ${msg}`
+                );
+            } finally {
+                clearTimeout(timeoutHandle);
+            }
+
+            const waitMs =
+                response.status === 429
+                    ? parseRetryAfterMs(response.headers.get("retry-after"))
+                    : null;
+            if (waitMs === null || Date.now() + waitMs > waitUntil) break;
+            await response.body?.cancel();
+            logger.debug(
+                `HttpLogDestination: "${this.config.url}" rate limited, ` +
+                    `retrying in ${waitMs} ms`
+            );
+            await sleep(waitMs);
         }
 
         if (!response.ok) {
@@ -313,6 +338,20 @@ export class HttpLogDestination implements LogDestinationProvider {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Parse a Retry-After header (delay in seconds, or an HTTP date) into ms.
+ * Returns null when the header is missing or unparseable.
+ */
+export function parseRetryAfterMs(value: string | null): number | null {
+    if (value === null || value.trim() === "") return null;
+    const seconds = Number(value);
+    if (Number.isFinite(seconds)) {
+        return seconds >= 0 ? Math.ceil(seconds * 1000) : null;
+    }
+    const date = Date.parse(value);
+    return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
+}
 
 function epochSecondsToIso(epochSeconds: number): string {
     return new Date(epochSeconds * 1000).toISOString();
