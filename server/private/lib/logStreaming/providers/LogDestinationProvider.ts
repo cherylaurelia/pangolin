@@ -32,7 +32,9 @@ export interface LogDestinationProvider {
      *
      * Implementations should:
      *  - Treat the call as atomic: either all events are accepted or an error
-     *    is thrown so the caller can retry / back off.
+     *    is thrown so the caller can retry / back off.  If the events go out
+     *    in several requests and some were accepted before the failure, throw
+     *    a `LogDeliveryError` saying how many, so they are not sent again.
      *  - Respect the timeout contract expected by the manager (default 30 s).
      *  - NOT swallow errors – the manager relies on thrown exceptions to track
      *    failure state and apply exponential back-off.
@@ -41,4 +43,20 @@ export interface LogDestinationProvider {
      * @throws        Any network, authentication, or serialisation error.
      */
     send(events: LogEvent[]): Promise<void>;
+}
+
+/**
+ * Thrown by a provider when the first `deliveredCount` events of a batch were
+ * accepted by the destination before a later one failed.  The manager moves
+ * the cursor past the delivered events before backing off.
+ */
+export class LogDeliveryError extends Error {
+    constructor(
+        message: string,
+        readonly deliveredCount: number,
+        options?: { cause?: unknown }
+    ) {
+        super(message, options);
+        this.name = "LogDeliveryError";
+    }
 }

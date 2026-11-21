@@ -13,7 +13,10 @@
 
 import logger from "@server/logger";
 import { LogEvent, HttpConfig, PayloadFormat } from "../types";
-import { LogDestinationProvider } from "./LogDestinationProvider";
+import {
+    LogDeliveryError,
+    LogDestinationProvider
+} from "./LogDestinationProvider";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,14 +91,19 @@ export class HttpLogDestination implements LogDestinationProvider {
         const format = this.config.format ?? DEFAULT_FORMAT;
 
         if (format === "json_single") {
-            // One HTTP POST per event – send sequentially so a failure on one
-            // event throws and lets the manager retry the whole batch from the
-            // same cursor position.
-            for (const event of events) {
-                await this.postRequest(
-                    this.buildSingleBody(event),
-                    "application/json"
-                );
+            // One HTTP POST per event, sent in order.  If one fails, report how
+            // many went out before it so the manager resumes after them.
+            for (let i = 0; i < events.length; i++) {
+                try {
+                    await this.postRequest(
+                        this.buildSingleBody(events[i]),
+                        "application/json"
+                    );
+                } catch (err) {
+                    const msg =
+                        err instanceof Error ? err.message : String(err);
+                    throw new LogDeliveryError(msg, i, { cause: err });
+                }
             }
             return;
         }

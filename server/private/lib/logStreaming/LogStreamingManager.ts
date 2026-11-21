@@ -35,7 +35,10 @@ import {
     HttpConfig,
     S3Config
 } from "./types";
-import { LogDestinationProvider } from "./providers/LogDestinationProvider";
+import {
+    LogDeliveryError,
+    LogDestinationProvider
+} from "./providers/LogDestinationProvider";
 import { HttpLogDestination } from "./providers/HttpLogDestination";
 import { S3LogDestination } from "./providers/S3LogDestination";
 import type { EventStreamingDestination } from "@server/db";
@@ -316,6 +319,7 @@ export class LogStreamingManager {
         if (enabledTypes.length === 0) return;
 
         let anyFailure = false;
+        let anyStalled = false;
         let firstError: string | null = null;
 
         for (const logType of enabledTypes) {
@@ -324,6 +328,12 @@ export class LogStreamingManager {
                 await this.processLogType(dest, provider, logType);
             } catch (err) {
                 anyFailure = true;
+                if (
+                    !(err instanceof LogDeliveryError) ||
+                    err.deliveredCount === 0
+                ) {
+                    anyStalled = true;
+                }
                 if (firstError === null) {
                     firstError =
                         err instanceof Error ? err.message : String(err);
@@ -337,7 +347,18 @@ export class LogStreamingManager {
         }
 
         if (anyFailure) {
-            this.recordFailure(dest.destinationId);
+            if (anyStalled) {
+                this.recordFailure(dest.destinationId);
+            } else {
+                // Every failing log type still delivered part of its batch, so
+                // the destination is up but slower than we send (e.g. rate
+                // limited): try again at the next poll instead of backing off.
+                this.failures.delete(dest.destinationId);
+                logger.debug(
+                    `LogStreamingManager: destination ${dest.destinationId} ` +
+                        `accepted part of a batch, retrying at the next poll`
+                );
+            }
             await this.setDestinationError(
                 dest.destinationId,
                 firstError ?? "Unknown error"
@@ -458,7 +479,27 @@ export class LogStreamingManager {
             const events = rows.map((row) => this.rowToLogEvent(logType, row));
 
             // Throws on failure – caught by the caller which applies back-off
-            await provider.send(events);
+            try {
+                await provider.send(events);
+            } catch (err) {
+                // Keep the events the destination already accepted, so the
+                // retry starts after them instead of resending the batch.
+                if (err instanceof LogDeliveryError && err.deliveredCount > 0) {
+                    const delivered = Math.min(err.deliveredCount, rows.length);
+                    await this.updateCursor(
+                        dest.destinationId,
+                        logType,
+                        rows[delivered - 1].id
+                    ).catch((cursorErr) =>
+                        logger.error(
+                            `LogStreamingManager: could not save partial progress ` +
+                                `for destination ${dest.destinationId} logType="${logType}"`,
+                            cursorErr
+                        )
+                    );
+                }
+                throw err;
+            }
 
             lastSentId = rows[rows.length - 1].id;
             await this.updateCursor(dest.destinationId, logType, lastSentId);
